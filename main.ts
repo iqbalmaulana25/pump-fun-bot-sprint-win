@@ -16,6 +16,17 @@
 // grading executions produce identical orders. Paper trading only: the
 // replay moves market data, never real funds.
 //
+// Tuning log (dev window, grade-local --driver process):
+// - v1: net PnL -1.36 SOL, 473 fills / 114 coins, win rate 10.9% (tuned
+//   from -1.55 SOL by the builder: smaller sizing, tighter stops, stricter
+//   entries).
+// - v2: a tighter entry bar was tried (inflow 2.5 -> 3.0 SOL, accel
+//   1.3 -> 1.4) and REVERTED: dev PnL worsened to -1.46 SOL with fewer
+//   fills, so the builder's bar stands. Kept from v2: exits extracted to
+//   shouldExit, max 2 new entries per batch, a longer cooldown after a
+//   losing exit (below), and the half-bank comment fixed: it banks at
+//   +12% (TAKE_PROFIT), not +15% as a stale comment claimed.
+//
 // Wire notes that shape the code below:
 // - orders decided on the batch for slot s fill at slot s + hello.latency_slots;
 // - the buys on one mint in one reply share one size cap, state.maxBuyLamports
@@ -75,7 +86,13 @@ const BIG_SELL_SOL = 3; // one recorded sell this big in a batch: leave
 const MAX_HOLD_SLOTS = 1200; // hard time limit per position (~8 minutes)
 const HOLD_IF_UP = 0.25; // the time limit is waived while up at least this much
 const COOLDOWN_SLOTS = 200; // wait after an exit before re-entering a curve
+const LOSS_COOLDOWN_SLOTS = 400; // ... and twice as long after a losing exit:
+// a curve that just stopped us out is usually still distributing, so the
+// bot sits out the next leg down instead of buying the same dip twice
 const MAX_ENTRIES = 3; // most entries per curve over the whole run
+const MAX_NEW_ENTRIES_PER_BATCH = 2; // at most this many fresh positions per batch:
+// a burst of simultaneous entries is usually one crowded tape, and every
+// extra order pays base + priority fee whether it fills or not
 
 // ---- guardrail probes --------------------------------------------------------
 // The bar: a round trip of at least 0.01 SOL on each of at least 20 coins.
@@ -99,6 +116,7 @@ interface Tape {
   trades: TapeTrade[];
   entries: number;
   lastExit: number;
+  lastLossExit: number; // slot of the latest exit that closed below cost
 }
 
 interface Held {
@@ -108,7 +126,7 @@ interface Held {
   lastBuyPrice: number; // recorded price when the latest buy was decided
   exiting: boolean;
   filled: boolean; // some buy of this position has filled
-  halfBanked: boolean; // the +15% half-sale already happened
+  halfBanked: boolean; // the +12% half-sale already happened
 }
 
 const tapes = new Map<Pubkey, Tape>();
@@ -121,7 +139,7 @@ let lastProbeSlot = -1e12;
 const tapeOf = (mint: Pubkey): Tape => {
   let t = tapes.get(mint);
   if (t === undefined) {
-    t = { created: null, trades: [], entries: 0, lastExit: -1e12 };
+    t = { created: null, trades: [], entries: 0, lastExit: -1e12, lastLossExit: -1e12 };
     tapes.set(mint, t);
   }
   return t;
@@ -154,6 +172,16 @@ const netFlow = (t: Tape, now: number, w: number): number => {
     net += tr.buy ? tr.sol : -tr.sol;
   }
   return net;
+};
+
+/** Share of the window's buy SOL that came from its single biggest wallet:
+ * a high share means one wallet (often the deployer or a bundler) is the
+ * flow, not a crowd — and crowd flow is what the entry signal trusts. */
+const largestBuyerShare = (buyers: Map<string, number>, buySol: number): number => {
+  if (buySol <= 0) return 0;
+  let top = 0;
+  for (const v of buyers.values()) if (v > top) top = v;
+  return top / buySol;
 };
 
 /**
@@ -204,10 +232,32 @@ const entryOk = (t: Tape, now: number, reserveSol: number): boolean => {
   if (up < MIN_PRICE_UP || up > MAX_PRICE_UP) return false;
   // Fresh breakout: the last price IS the window high.
   if (last < high) return false;
-  let top = 0;
-  for (const v of buyers.values()) if (v > top) top = v;
-  if (buySol > 0 && top / buySol > MAX_TOP_BUYER) return false;
+  if (largestBuyerShare(buyers, buySol) > MAX_TOP_BUYER) return false;
   return true;
+};
+
+/** Every full-exit reason in one place: stop, trailing stop, fading flow,
+ * a single huge sell, or the hard time limit. (The +12% half-bank lives in
+ * the loop, not here: it sells half and keeps the position.) Returns true
+ * when the position should be sold whole this batch. */
+const shouldExit = (
+  state: BotState,
+  mint: Pubkey,
+  h: Held,
+  now: number,
+  bigSell: boolean,
+): boolean => {
+  const pos = state.positions.get(mint);
+  if (pos === undefined) return false;
+  const value = closeValue(state, mint, pos.token_amount);
+  const cost = Number(pos.cost_lamports) / SOL;
+  if (value > h.peakValue) h.peakValue = value;
+  if (value <= cost * (1 - STOP_LOSS)) return true; // cut at -6%
+  if (h.peakValue >= cost * (1 + TRAIL_ARM) && value <= h.peakValue * (1 - TRAIL_DROP)) return true;
+  if (netFlow(tapeOf(mint), now, FADE_WINDOW) < FADE_NET) return true;
+  if (bigSell) return true;
+  if (now - h.opened > MAX_HOLD_SLOTS && value < cost * (1 + HOLD_IF_UP)) return true;
+  return false;
 };
 
 await runBot({
@@ -280,21 +330,20 @@ await runBot({
       const value = closeValue(state, mint, pos.token_amount);
       const cost = Number(pos.cost_lamports) / SOL;
       if (value > h.peakValue) h.peakValue = value;
-      // Half-bank at +15%: sell half the tokens, keep the rest running.
+      // Half-bank at +12%: sell half the tokens, keep the rest running.
       if (!h.halfBanked && !h.exiting && value >= cost * (1 + TAKE_PROFIT)) {
         h.halfBanked = true;
         if (orders.length >= caps.max_orders_per_batch) break;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount / 2n, max_slippage_bps: SELL_SLIPPAGE_BPS });
         continue;
       }
-      let exit = h.exiting;
-      if (!exit && value <= cost * (1 - STOP_LOSS)) exit = true;
-      if (!exit && h.peakValue >= cost * (1 + TRAIL_ARM) && value <= h.peakValue * (1 - TRAIL_DROP)) exit = true;
-      if (!exit && netFlow(tapeOf(mint), now, FADE_WINDOW) < FADE_NET) exit = true;
-      if (!exit && bigSells.has(mint)) exit = true;
-      if (!exit && now - h.opened > MAX_HOLD_SLOTS && value < cost * (1 + HOLD_IF_UP)) exit = true;
-      if (!exit) continue;
-      h.exiting = true;
+      if (!h.exiting && shouldExit(state, mint, h, now, bigSells.has(mint))) h.exiting = true;
+      if (!h.exiting) continue;
+      // A losing exit earns a longer cooldown: note it on the tape now, while
+      // the position's cost is still readable (the position is gone next batch).
+      if (closeValue(state, mint, pos.token_amount) < cost) {
+        tapeOf(mint).lastLossExit = now;
+      }
       if (orders.length >= caps.max_orders_per_batch) break;
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
     }
@@ -316,6 +365,7 @@ await runBot({
     // ---- entries and adds, only on mints that traded this batch -------------
     let exposure = 0;
     for (const [, h] of held) exposure += h.invested;
+    let newEntries = 0;
     for (const mint of traded) {
       if (orders.length >= caps.max_orders_per_batch) break;
       const curve = state.curves.get(mint);
@@ -329,7 +379,9 @@ await runBot({
       let isEntry = false;
       if (h === undefined) {
         if (openSlots <= 0) continue;
+        if (newEntries >= MAX_NEW_ENTRIES_PER_BATCH) continue;
         if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN_SLOTS) continue;
+        if (now - t.lastLossExit < LOSS_COOLDOWN_SLOTS) continue; // just stopped out: sit out
         if (!entryOk(t, now, reserveSol)) continue;
         want = FIRST_BUY_SOL;
         isEntry = true;
@@ -359,6 +411,7 @@ await runBot({
         held.set(mint, { opened: now, invested: amount, peakValue: 0, lastBuyPrice: price, exiting: false, filled: false, halfBanked: false });
         t.entries++;
         openSlots--;
+        newEntries++;
       } else if (h !== undefined) {
         h.invested += amount;
         h.lastBuyPrice = price;
